@@ -1,6 +1,8 @@
 import cv2
 import os
+import sys
 import time
+import subprocess
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -13,6 +15,31 @@ import io
 
 # Import class từ file image_processor.py
 from image_processor import ImageEnhancer
+
+# --- HẰNG SỐ & TIỆN ÍCH KIỂM TRA PPE THEO TỪNG NGƯỜI ---
+CONTAINMENT_THRESHOLD = 0.5   # tỉ lệ box đồ bảo hộ phải nằm trong box người để được gán cho người đó
+DEBOUNCE_SECONDS = 2.0        # thời gian xác nhận vi phạm (chống nhấp nháy)
+RESET_GRACE = 0.5             # giây: scene phải sạch liên tục lâu hơn ngần này mới xoá bộ đếm
+                              # -> dropout/nhận nhầm 1-2 frame không làm mất thời gian đã tích luỹ
+
+# Ánh xạ item trên UI -> (class khẳng định, class phủ định) của model
+ITEM_MAP = {
+    'Hardhat': ('Hardhat', 'NO-Hardhat'),
+    'Safety Vest': ('Safety Vest', 'NO-Safety Vest'),
+    'Mask': ('Mask', 'NO-Mask'),
+}
+GEAR_NAMES = {'Hardhat', 'Mask', 'Safety Vest', 'NO-Hardhat', 'NO-Mask', 'NO-Safety Vest'}
+
+def _area(b):
+    return max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+
+def _inter(a, b):
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
+    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+def _center(b):
+    return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
 
 # --- QUẢN LÝ EXCEL ---
 class ViolationLogger:
@@ -58,60 +85,116 @@ class ViolationLogger:
         except Exception as e:
             print(f"Lỗi ghi Excel: {e}")
 
-# --- BỘ NHẬN DIỆN YOLO TÍCH HỢP IMAGE ENHANCER ---
+# --- BỘ NHẬN DIỆN YOLO: KIỂM TRA PPE ĐỘC LẬP TỪNG NGƯỜI ---
 class PPEDetector:
     def __init__(self, model_path):
         self.model = YOLO(model_path)
-        self.class_names = self.model.names 
-        self.violation_start_time = None 
+        self.class_names = self.model.names
+        self.violation_start = None   # thời điểm bắt đầu chuỗi frame liên tục CÓ vi phạm
+        self.clear_since = None       # thời điểm scene bắt đầu sạch (để áp dụng ân hạn reset)
 
-    def detect_and_check(self, frame, required_items):
+    def detect_and_check(self, frame, required_items, still=False):
+        # Tiền xử lý: chỉ giữ CLAHE (bỏ blur + sharpen vì làm méo đặc trưng YOLO)
+        proc = ImageEnhancer.apply_clahe(frame)
+        results = self.model(proc, stream=True, conf=0.4)
 
-        # 1. Giảm nhiễu
-        processed_frame = ImageEnhancer.reduce_noise(frame)
-        # 2. Cân bằng độ tương phản (CLAHE)
-        processed_frame = ImageEnhancer.apply_clahe(processed_frame)
-        # 3. Làm sắc nét để AI dễ nhận diện cạnh vật thể
-        processed_frame = ImageEnhancer.sharpen_image(processed_frame)
-
-        # Nhận diện vật thể 
-        results = self.model(processed_frame, stream=True, conf=0.4)
-        
-        detected_classes = set()
-        annotated_frame = frame.copy() # Vẽ lên frame gốc để hiển thị trung thực
-        
-        found_person = False
+        persons, gears = [], []
         for r in results:
-            # Lấy thông tin vẽ box từ ảnh xử lý áp lên frame hiển thị
-            annotated_frame = r.plot(img=annotated_frame) 
             for box in r.boxes:
                 name = self.class_names.get(int(box.cls), "Unknown")
-                detected_classes.add(name)
-                if name == 'Person': found_person = True
+                xyxy = box.xyxy[0].tolist()
+                conf = float(box.conf)
+                if name == 'Person':
+                    persons.append({'box': xyxy, 'gear': []})
+                elif name in GEAR_NAMES:
+                    gears.append({'name': name, 'conf': conf, 'box': xyxy, 'c': _center(xyxy)})
 
-        # Logic kiểm tra vi phạm
-        violations = []
-        for item in required_items:
-            # Kiểm tra nếu thiếu item so với yêu cầu
-            if (found_person and item not in detected_classes):
-                violations.append(item)
+        # Gán mỗi box đồ bảo hộ cho đúng MỘT người theo độ chứa (containment), conf cao xét trước
+        for g in sorted(gears, key=lambda g: -g['conf']):
+            cand = [(_inter(g['box'], p['box']) / max(_area(g['box']), 1e-6), p) for p in persons]
+            if not cand:
+                continue
+            max_c = max(c for c, _ in cand)
+            if max_c < CONTAINMENT_THRESHOLD:
+                continue   # đồ bảo hộ không nằm đủ trong ai -> bỏ qua
+            # Trong các ứng viên gần hoà (chênh <=0.05), chọn người có tâm box gần đồ bảo hộ nhất
+            gc = g['c']
+            near = [p for c, p in cand if max_c - c <= 0.05]
+            best_p = min(near, key=lambda p: (gc[0]-_center(p['box'])[0])**2 + (gc[1]-_center(p['box'])[1])**2)
+            best_p['gear'].append(g)
 
-        is_safe = True
-        msg, color = "SCANNING...", (255, 255, 0)
+        # --- Kiểm tra KHÔNG GIAN: từng người độc lập trong frame này ---
+        per_person = []        # [(box, missing_items)]
+        frame_missing = set()
+        any_violating = False
+        for p in persons:
+            missing = []
+            for item in required_items:
+                pos_name, neg_name = ITEM_MAP[item]
+                pos = max([g['conf'] for g in p['gear'] if g['name'] == pos_name], default=None)
+                neg = max([g['conf'] for g in p['gear'] if g['name'] == neg_name], default=None)
+                if neg is not None and (pos is None or neg >= pos):
+                    missing.append(item)            # NO-* là tín hiệu vi phạm model đã học -> thiếu
+                elif pos is not None and (neg is None or pos > neg):
+                    pass                            # có đồ bảo hộ -> đạt
+                else:
+                    missing.append(item)            # không tín hiệu nào -> coi như thiếu (fail-closed)
+            per_person.append((p['box'], missing))
+            if missing:
+                any_violating = True
+                frame_missing.update(missing)
 
-        if found_person and violations:
-            if self.violation_start_time is None: self.violation_start_time = time.time()
-            elapsed = time.time() - self.violation_start_time
-            if elapsed >= 2:
-                is_safe, msg, color = False, f"DANGER: MISSING {', '.join(violations)}", (0, 0, 255)
-            else:
-                msg, color = f"VERIFYING ({int(2-elapsed)}s)", (0, 255, 255)
+        # --- Xác nhận theo THỜI GIAN: một bộ đếm chung ---
+        # Chỉ cần frame liên tục CÓ vi phạm đủ lâu là báo động; không bám danh tính từng người
+        # (tránh hồi quy false-SAFE khi người di chuyển/đứng cạnh nhau). Có ân hạn reset để
+        # detector rớt box 1-2 frame không xoá mất thời gian đã tích luỹ.
+        now = time.time()
+        if still:
+            confirmed, remaining = any_violating, 0
         else:
-            self.violation_start_time = None
-            if found_person: msg, color = "STATUS: SAFE", (0, 255, 0)
+            if any_violating:
+                self.clear_since = None
+                if self.violation_start is None:
+                    self.violation_start = now
+            elif self.violation_start is not None:
+                if self.clear_since is None:
+                    self.clear_since = now
+                if now - self.clear_since >= RESET_GRACE:
+                    self.violation_start = self.clear_since = None
+            if self.violation_start is not None:
+                elapsed = now - self.violation_start
+                confirmed = elapsed >= DEBOUNCE_SECONDS
+                remaining = max(1, int(DEBOUNCE_SECONDS - elapsed))
+            else:
+                confirmed, remaining = False, 0
 
-        cv2.putText(annotated_frame, msg, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
-        return annotated_frame, is_safe, violations
+        # --- Vẽ: mỗi người tô màu theo trạng thái không gian của họ + cờ confirmed chung ---
+        annotated = frame.copy()
+        GREEN, YELLOW, RED, CYAN = (0, 255, 0), (0, 255, 255), (0, 0, 255), (255, 255, 0)
+        FONT = cv2.FONT_HERSHEY_SIMPLEX
+        for box, missing in per_person:
+            x1, y1, x2, y2 = [int(v) for v in box]
+            if not missing:
+                col, lbl = GREEN, "OK"
+            elif confirmed:
+                col, lbl = RED, "MISSING: " + ", ".join(missing)
+            else:
+                col, lbl = YELLOW, "VERIFYING (%ds)" % remaining
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), col, 2)
+            cv2.putText(annotated, lbl, (x1, max(20, y1 - 8)), FONT, 0.6, col, 2)
+
+        # Banner tổng hợp suy ra từ cùng cờ confirmed -> luôn khớp màu box
+        if not persons:
+            is_safe, banner, bcol = True, "SCANNING...", CYAN
+        elif confirmed:
+            is_safe, banner, bcol = False, "DANGER: MISSING " + ", ".join(sorted(frame_missing)), RED
+        elif any_violating:
+            is_safe, banner, bcol = True, "VERIFYING...", YELLOW
+        else:
+            is_safe, banner, bcol = True, "STATUS: SAFE", GREEN
+
+        cv2.putText(annotated, banner, (20, 50), FONT, 0.8, bcol, 2)
+        return annotated, is_safe, sorted(frame_missing)
 
 # --- GIAO DIỆN NGƯỜI DÙNG ---
 class PPEApp:
@@ -163,12 +246,13 @@ class PPEApp:
             self.stop_stream()
             frame = cv2.imread(path)
             if frame is not None:
-                self._run_logic(frame)
+                self._run_logic(frame, still=True)
 
     def process_video(self):
         path = filedialog.askopenfilename()
         if path:
             self.stop_stream()
+            self.detector.violation_start = self.detector.clear_since = None   # tránh kế thừa bộ đếm cũ
             self.is_running = True
             threading.Thread(target=self.video_loop, args=(path,), daemon=True).start()
 
@@ -182,9 +266,9 @@ class PPEApp:
         cap.release()
         self.is_running = False
 
-    def _run_logic(self, frame):
+    def _run_logic(self, frame, still=False):
         req = [k for k, v in self.check_vars.items() if v.get()]
-        res_f, safe, viol = self.detector.detect_and_check(frame, req)
+        res_f, safe, viol = self.detector.detect_and_check(frame, req, still=still)
         self.window.after(0, self.update_display, res_f)
         
         if not safe:
@@ -196,8 +280,16 @@ class PPEApp:
             self.window.after(0, lambda: self.status_lbl.config(text="TRẠNG THÁI: AN TOÀN", bg='#27ae60'))
 
     def open_excel(self):
-        try: os.startfile(os.path.abspath(self.excel_logger.filename))
-        except: messagebox.showerror("Lỗi", "Không thể mở file.")
+        path = os.path.abspath(self.excel_logger.filename)
+        try:
+            if sys.platform.startswith('win'):
+                os.startfile(path)
+            elif sys.platform == 'darwin':
+                subprocess.run(['open', path])
+            else:
+                subprocess.run(['xdg-open', path])
+        except Exception:
+            messagebox.showerror("Lỗi", "Không thể mở file.")
 
     def stop_stream(self):
         self.is_running = False
