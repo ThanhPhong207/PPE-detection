@@ -1,0 +1,17 @@
+services:
+  fastapi-ai-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fastapi-ai-service
+    expose:
+      - "8000"
+    volumes:
+      - ./app:/app
+      - ../models:/models
+    networks:
+      - ppe-global-network
+
+networks:
+  ppe-global-network:
+    name: ppe-global-network
