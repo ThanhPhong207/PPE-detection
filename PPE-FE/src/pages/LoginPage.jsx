@@ -7,6 +7,15 @@ const LoginPage = () => {
         window.location.href = "http://localhost:8080/api/oauth2/authorization/google";
     };
 
+    const handleDevLogin = () => {
+        document.cookie = "userId=1; path=/";
+        document.cookie = "accessToken=dev-token-bypass-12345; path=/";
+        document.cookie = "userRole=ADMIN; path=/";
+        document.cookie = "userFullName=Developer Admin; path=/";
+        document.cookie = "userAvatarUrl=; path=/";
+        window.location.href = "/";
+    };
+
     return (
         <div className="intense-login-wrapper">
             {/* Background Core Matrix */}
@@ -99,6 +108,27 @@ const LoginPage = () => {
                             </svg>
                             <span>Authenticate via Google</span>
                             <span className="auth-arrow">→</span>
+                        </button>
+
+                        {/* Developer login bypass */}
+                        <button onClick={handleDevLogin} style={{
+                            width: "100%",
+                            background: "rgba(6, 182, 212, 0.1)",
+                            color: "var(--cyan-core)",
+                            border: "1px solid var(--cyan-core)",
+                            padding: "0.95rem 1.5rem",
+                            borderRadius: "8px",
+                            fontSize: "0.95rem",
+                            fontWeight: "700",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            cursor: "pointer",
+                            marginTop: "1rem",
+                            boxSizing: "border-box",
+                            transition: "all 0.3s"
+                        }}>
+                            <span>Bypass with Developer Account</span>
                         </button>
 
                         <div className="divider">

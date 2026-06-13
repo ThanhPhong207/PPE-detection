@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     VIOLATION_THRESHOLD_SECONDS: float = 5.0
     COOLDOWN_DUPLICATE_SECONDS: float = 60.0
     
-    SPRING_BOOT_API_URL: str = "http://spring-boot-backend:8080/api/v1/violations/report"
+    SPRING_BOOT_API_URL: str = "http://localhost:8080/api/v1/violations/report"
 
     CLOUDINARY_CLOUD_NAME: str = ""
     CLOUDINARY_API_KEY: str = ""

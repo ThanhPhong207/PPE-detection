@@ -183,13 +183,32 @@ class PPEDetector:
             cv2.rectangle(annotated, (x1, y1), (x2, y2), col, 2)
             cv2.putText(annotated, lbl, (x1, max(20, y1 - 8)), FONT, 0.6, col, 2)
 
+        # Vẽ các đồ bảo hộ đã phát hiện (để hiện chỉ số confidence như bản PPE-detection)
+        for g in gears:
+            gx1, gy1, gx2, gy2 = [int(v) for v in g['box']]
+            gname = g['name']
+            gconf = g['conf']
+            
+            # Chọn màu cho gear (BGR format)
+            if gname.startswith("NO-"):
+                gcol = (0, 0, 255) # Đỏ cho trạng thái vi phạm (NO-Hardhat, NO-Vest, NO-Mask)
+            elif gname in ['Hardhat', 'Safety Vest', 'Mask']:
+                gcol = (0, 255, 0) # Xanh lá cho các trang phục bảo hộ an toàn
+            else:
+                gcol = (255, 255, 255) # Trắng mặc định
+                
+            cv2.rectangle(annotated, (gx1, gy1), (gx2, gy2), gcol, 1)
+            glbl = f"{gname} {int(gconf * 100)}%"
+            cv2.putText(annotated, glbl, (gx1, max(15, gy1 - 5)), FONT, 0.45, gcol, 1)
+
         # Banner tổng hợp suy ra từ cùng cờ confirmed -> luôn khớp màu box
         if not persons:
             is_safe, banner, bcol = True, "SCANNING...", CYAN
         elif confirmed:
             is_safe, banner, bcol = False, "DANGER: MISSING " + ", ".join(sorted(frame_missing)), RED
         elif any_violating:
-            is_safe, banner, bcol = True, "VERIFYING...", YELLOW
+            banner = f"VERIFYING ({remaining}s)..." if remaining > 0 else "VERIFYING..."
+            is_safe, bcol = True, YELLOW
         else:
             is_safe, banner, bcol = True, "STATUS: SAFE", GREEN
 

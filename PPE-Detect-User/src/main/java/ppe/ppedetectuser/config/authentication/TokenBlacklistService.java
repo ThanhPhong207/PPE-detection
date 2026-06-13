@@ -1,38 +1,32 @@
 package ppe.ppedetectuser.config.authentication;
 
-import lombok.RequiredArgsConstructor;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
-
-import java.util.concurrent.TimeUnit;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Service
-@RequiredArgsConstructor
 public class TokenBlacklistService {
 
-    private final StringRedisTemplate redisTemplate;
-    private static final String BLACKLIST_PREFIX = "blacklist:";
-    private static final String REFRESH_PREFIX = "refresh:";
+    private final Map<String, Boolean> blacklistMap = new ConcurrentHashMap<>();
+    private final Map<String, String> refreshMap = new ConcurrentHashMap<>();
 
     public void blacklist(String token, long ttlMillis) {
-        redisTemplate.opsForValue()
-                .set(BLACKLIST_PREFIX + token, "true", ttlMillis, TimeUnit.MILLISECONDS);
+        blacklistMap.put(token, true);
     }
 
     public boolean isBlacklisted(String token) {
-        return Boolean.TRUE.equals(redisTemplate.hasKey(BLACKLIST_PREFIX + token));
+        return blacklistMap.containsKey(token);
     }
 
     public void saveRefreshToken(String userId, String refreshToken, long ttlMillis) {
-        redisTemplate.opsForValue()
-                .set(REFRESH_PREFIX + userId, refreshToken, ttlMillis, TimeUnit.MILLISECONDS);
+        refreshMap.put(userId, refreshToken);
     }
 
     public String getRefreshToken(String userId) {
-        return redisTemplate.opsForValue().get(REFRESH_PREFIX + userId);
+        return refreshMap.get(userId);
     }
 
     public void deleteRefreshToken(String userId) {
-        redisTemplate.delete(REFRESH_PREFIX + userId);
+        refreshMap.remove(userId);
     }
 }
